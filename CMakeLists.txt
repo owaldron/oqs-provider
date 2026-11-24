@@ -40,6 +40,9 @@ else()
     message(STATUS "Build will store public keys in PKCS#8 structures")
 endif()
 
+option(OQS_PROVIDER_EMBED_HYBRIDS "SPIKE: serve hybrid algorithms from an embedded hybrid-provider instead of oqsprovider's own hybrid code" OFF)
+set(HYBRID_PROVIDER_SOURCE_DIR "" CACHE PATH "hybrid-provider source tree used by OQS_PROVIDER_EMBED_HYBRIDS")
+
 option(OQS_PROVIDER_BUILD_STATIC "Build a static library instead of a shared library" OFF)
 if(OQS_PROVIDER_BUILD_STATIC AND BUILD_SHARED_LIBS)
   message(FATAL_ERROR "`OQS_PROVIDER_BUILD_STATIC` is not compatible with `BUILD_SHARED_LIBS`.")

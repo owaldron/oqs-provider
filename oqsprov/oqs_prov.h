@@ -91,6 +91,12 @@ typedef struct prov_oqs_ctx_st {
     const OSSL_CORE_HANDLE *handle;
     OSSL_LIB_CTX *libctx; /* For all provider modules */
     BIO_METHOD *corebiometh;
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    /* embedded hybrid-provider instance (hybrid_embed.h) and the per-operation
+     * query tables merging our native algorithms with its hybrids */
+    void *hybrid_ctx;
+    OSSL_ALGORITHM *merged_algs[5];
+#endif
 } PROV_OQS_CTX;
 
 PROV_OQS_CTX *oqsx_newprovctx(OSSL_LIB_CTX *libctx,

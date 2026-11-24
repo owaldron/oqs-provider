@@ -1578,8 +1578,8 @@ int cnt_rt_disabled(const OSSL_ALGORITHM orig[], int len) {
     CRYPTO_THREAD_unlock(rt_lock);                                             \
     return algs##_rt
 
-static const OSSL_ALGORITHM *oqsprovider_query(void *provctx, int operation_id,
-                                               int *no_cache) {
+static const OSSL_ALGORITHM *
+oqsprovider_query_native(void *provctx, int operation_id, int *no_cache) {
     int d_algs, n_cnt;
 
     if (!CRYPTO_THREAD_write_lock(rt_lock))
@@ -1612,6 +1612,184 @@ static const OSSL_ALGORITHM *oqsprovider_query(void *provctx, int operation_id,
     return NULL;
 }
 
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+/*
+ * SPIKE: hybrids come from an embedded hybrid-provider (hybrid_embed.h).
+ * oqsprovider withdraws its own hybrid implementations (all five operation
+ * tables + TLS capabilities, via rt_disabled_algs) and exposes hybrid-provider's
+ * instead, restricted to the names this oqsprovider build used to serve itself.
+ */
+#include "hybrid_embed.h"
+
+static const int oqs_embed_ops[5] = {OSSL_OP_SIGNATURE, OSSL_OP_KEM,
+                                     OSSL_OP_KEYMGMT, OSSL_OP_ENCODER,
+                                     OSSL_OP_DECODER};
+
+/* The classification proposed in #855 (OQS_CEDE_HYBRIDS). */
+static int oqs_is_hybrid_name(const char *name) {
+    static const char *const prefixes[] = {"p256_",   "p384_",  "p521_",
+                                           "x25519_", "x448_",  "bp256_",
+                                           "bp384_",  "bp512_", "rsa3072_"};
+    size_t i;
+
+    for (i = 0; i < OSSL_NELEM(prefixes); i++)
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0)
+            return 1;
+    /* MLX-style hybrids: no classical prefix, upper-case MLKEM token */
+    return strstr(name, "MLKEM") != NULL;
+}
+
+/* Hybrids oqsprovider's own OpenSSL-version policy disables (e.g. the MLX
+ * groups on >= 3.5, left to the default provider). Rebuilt on every load under
+ * rt_lock by oqs_withdraw_own_hybrids(); the embedded provider must honour it
+ * too rather than rely on its load-order-sensitive cede-to-default probe. */
+static STACK_OF(OPENSSL_STRING) *rt_embed_denied = NULL;
+
+/* allow(): exactly the hybrids this build of oqsprovider would serve itself.
+ * Names match case-insensitively, as OpenSSL does. */
+static int oqs_embed_allow(const char *name) {
+    const OSSL_ALGORITHM *const lists[] = {oqsprovider_signatures,
+                                           oqsprovider_asym_kems};
+    const OSSL_ALGORITHM *a;
+    size_t li;
+    int i, denied = 0;
+
+    if (!oqs_is_hybrid_name(name))
+        return 0;
+    if (!CRYPTO_THREAD_read_lock(rt_lock))
+        return 0;
+    for (i = 0; i < sk_OPENSSL_STRING_num(rt_embed_denied); i++)
+        if (OPENSSL_strcasecmp(sk_OPENSSL_STRING_value(rt_embed_denied, i),
+                               name) == 0)
+            denied = 1;
+    CRYPTO_THREAD_unlock(rt_lock);
+    if (denied)
+        return 0;
+    for (li = 0; li < OSSL_NELEM(lists); li++)
+        for (a = lists[li]; a->algorithm_names != NULL; a++)
+            if (OPENSSL_strcasecmp(a->algorithm_names, name) == 0)
+                return 1;
+    return 0;
+}
+
+static void *oqs_embed_resolve(void *provctx) {
+    return ((PROV_OQS_CTX *)provctx)->hybrid_ctx;
+}
+
+/* Caller holds rt_lock. */
+static void oqs_withdraw_own_hybrids(void) {
+    const OSSL_ALGORITHM *const lists[] = {
+        oqsprovider_signatures, oqsprovider_asym_kems, oqsprovider_keymgmt,
+        oqsprovider_encoder, oqsprovider_decoder};
+    const OSSL_ALGORITHM *a;
+    size_t li;
+    int i;
+
+    /* first remember which hybrids the version policy already disabled */
+    if (rt_embed_denied == NULL)
+        rt_embed_denied = sk_OPENSSL_STRING_new_null();
+    else
+        sk_OPENSSL_STRING_zero(rt_embed_denied);
+    for (i = 0; rt_embed_denied != NULL &&
+                i < sk_OPENSSL_STRING_num(rt_disabled_algs);
+         i++)
+        if (oqs_is_hybrid_name(sk_OPENSSL_STRING_value(rt_disabled_algs, i)))
+            sk_OPENSSL_STRING_push(rt_embed_denied,
+                                   sk_OPENSSL_STRING_value(rt_disabled_algs, i));
+
+    for (li = 0; li < OSSL_NELEM(lists); li++)
+        for (a = lists[li]; a->algorithm_names != NULL; a++)
+            if (oqs_is_hybrid_name(a->algorithm_names) &&
+                sk_OPENSSL_STRING_find(rt_disabled_algs,
+                                       (char *)a->algorithm_names) < 0) {
+                rt_algo_filter_enabled = 1;
+                sk_OPENSSL_STRING_push(rt_disabled_algs,
+                                       (char *)a->algorithm_names);
+            }
+}
+
+static OSSL_ALGORITHM *oqs_concat_algs(const OSSL_ALGORITHM *a,
+                                       const OSSL_ALGORITHM *b) {
+    size_t na = 0, nb = 0;
+    OSSL_ALGORITHM *out;
+
+    while (a != NULL && a[na].algorithm_names != NULL)
+        na++;
+    while (b != NULL && b[nb].algorithm_names != NULL)
+        nb++;
+    if ((out = OPENSSL_zalloc((na + nb + 1) * sizeof(*out))) == NULL)
+        return NULL;
+    if (na)
+        memcpy(out, a, na * sizeof(*out));
+    if (nb)
+        memcpy(out + na, b, nb * sizeof(*out));
+    return out; /* zalloc'd terminator */
+}
+
+static int oqs_embed_hybrids_init(PROV_OQS_CTX *ctx,
+                                  const OSSL_CORE_HANDLE *handle,
+                                  const OSSL_DISPATCH *in) {
+    size_t i;
+    int nc;
+
+    if (!hybrid_embed_init(handle, in, oqs_embed_allow, oqs_embed_resolve,
+                           &ctx->hybrid_ctx))
+        return 0;
+    for (i = 0; i < OSSL_NELEM(oqs_embed_ops); i++) {
+        ctx->merged_algs[i] = oqs_concat_algs(
+            oqsprovider_query_native(ctx, oqs_embed_ops[i], &nc),
+            hybrid_embed_query(ctx->hybrid_ctx, oqs_embed_ops[i]));
+        if (ctx->merged_algs[i] == NULL)
+            return 0;
+    }
+    return 1;
+}
+
+static void oqs_embed_hybrids_free(PROV_OQS_CTX *ctx) {
+    size_t i;
+
+    if (ctx == NULL)
+        return;
+    for (i = 0; i < OSSL_NELEM(oqs_embed_ops); i++) {
+        OPENSSL_free(ctx->merged_algs[i]);
+        ctx->merged_algs[i] = NULL;
+    }
+    if (ctx->hybrid_ctx != NULL)
+        hybrid_embed_teardown(ctx->hybrid_ctx);
+    ctx->hybrid_ctx = NULL;
+}
+#endif /* OQS_PROVIDER_EMBED_HYBRIDS */
+
+static const OSSL_ALGORITHM *oqsprovider_query(void *provctx, int operation_id,
+                                               int *no_cache) {
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    PROV_OQS_CTX *ctx = provctx;
+    size_t i;
+
+    if (ctx != NULL && ctx->hybrid_ctx != NULL)
+        for (i = 0; i < OSSL_NELEM(oqs_embed_ops); i++)
+            if (oqs_embed_ops[i] == operation_id) {
+                *no_cache = 0;
+                return ctx->merged_algs[i];
+            }
+#endif
+    return oqsprovider_query_native(provctx, operation_id, no_cache);
+}
+
+static int oqsprovider_get_capabilities(void *provctx, const char *capability,
+                                        OSSL_CALLBACK *cb, void *arg) {
+    int rc = oqs_provider_get_capabilities(provctx, capability, cb, arg);
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    PROV_OQS_CTX *ctx = provctx;
+
+    if (ctx != NULL && ctx->hybrid_ctx != NULL)
+        rc = hybrid_embed_get_capabilities(ctx->hybrid_ctx, capability, cb,
+                                           arg) ||
+             rc;
+#endif
+    return rc;
+}
+
 /* Other library contexts may still have the provider loaded: the state they
  * share is released by the last instance to go.
  */
@@ -1631,12 +1809,19 @@ static void rt_unload(void) {
         oqsprovider_decoder_rt = NULL;
         sk_OPENSSL_STRING_free(rt_disabled_algs);
         rt_disabled_algs = NULL;
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+        sk_OPENSSL_STRING_free(rt_embed_denied);
+        rt_embed_denied = NULL;
+#endif
         OQS_destroy();
     }
     CRYPTO_THREAD_unlock(rt_lock);
 }
 
 static void oqsprovider_teardown(void *provctx) {
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    oqs_embed_hybrids_free((PROV_OQS_CTX *)provctx);
+#endif
     oqsx_freeprovctx((PROV_OQS_CTX *)provctx);
     rt_unload();
 }
@@ -1649,7 +1834,7 @@ static const OSSL_DISPATCH oqsprovider_dispatch_table[] = {
     {OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))oqsprovider_get_params},
     {OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))oqsprovider_query},
     {OSSL_FUNC_PROVIDER_GET_CAPABILITIES,
-     (void (*)(void))oqs_provider_get_capabilities},
+     (void (*)(void))oqsprovider_get_capabilities},
     {0, NULL}};
 
 #ifdef OQS_PROVIDER_STATIC
@@ -1875,6 +2060,11 @@ int OQS_PROVIDER_ENTRYPOINT_NAME(const OSSL_CORE_HANDLE *handle,
 
     ///// OQS_TEMPLATE_FRAGMENT_DISABLE_OSSL_ALGS_END
 
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    /* hybrids are served by the embedded hybrid-provider instead */
+    oqs_withdraw_own_hybrids();
+#endif
+
     /* Registering an OID can make the core load its configuration, which may
      * load this provider again on the same thread. rt_lock is not recursive,
      * so work from a private copy of the list and never hold the lock across
@@ -1996,6 +2186,13 @@ int OQS_PROVIDER_ENTRYPOINT_NAME(const OSSL_CORE_HANDLE *handle,
         ERR_raise(ERR_LIB_USER, OQSPROV_R_LIB_CREATE_ERR);
         goto end_init;
     }
+
+#ifdef OQS_PROVIDER_EMBED_HYBRIDS
+    if (!oqs_embed_hybrids_init((PROV_OQS_CTX *)*provctx, handle, orig_in)) {
+        OQS_PROV_PRINTF("OQS PROV: embedded hybrid-provider init failed\n");
+        goto end_init;
+    }
+#endif
 
     *out = oqsprovider_dispatch_table;
 
