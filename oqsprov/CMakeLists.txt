@@ -78,6 +78,18 @@ endif()
 
 target_link_libraries(oqsprovider PUBLIC OQS::oqs ${OPENSSL_CRYPTO_LIBRARY} ${OQS_ADDL_SOCKET_LIBS})
 
+if(OQS_PROVIDER_EMBED_HYBRIDS)
+  if(NOT EXISTS "${HYBRID_PROVIDER_SOURCE_DIR}/hybrid_embed.h")
+    message(FATAL_ERROR "OQS_PROVIDER_EMBED_HYBRIDS needs HYBRID_PROVIDER_SOURCE_DIR pointing at a hybrid-provider tree with hybrid_embed.h")
+  endif()
+  message(STATUS "Embedding hybrid-provider from ${HYBRID_PROVIDER_SOURCE_DIR}")
+  # register the embedded algorithms as provider=oqsprovider, not provider=hybrid
+  set(HYBRID_EMBED_PROVIDER_NAME "oqsprovider" CACHE STRING "" FORCE)
+  add_subdirectory("${HYBRID_PROVIDER_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/hybrid-provider" EXCLUDE_FROM_ALL)
+  target_link_libraries(oqsprovider PRIVATE hybrid-embed)
+  target_compile_definitions(oqsprovider PRIVATE OQS_PROVIDER_EMBED_HYBRIDS)
+endif()
+
 # Hide liboqs symbols to applications loading oqsprovider.
 # CheckLinkerFlag requires CMake 3.18, target_link_options requires CMake 3.13.
 if(LIBOQS_LIBRARY_TYPE STREQUAL "STATIC_LIBRARY" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.18")
